@@ -1,7 +1,8 @@
 import numpy as np
-import matplotlib as mpl
 import matplotlib.pyplot as plt
-from matplotlib.widgets import Button
+import inspect
+import pandas as pd
+from matplotlib_scalebar.scalebar import ScaleBar
 
 from skimage import transform as tf
 from skimage import morphology as mph
@@ -10,62 +11,95 @@ from scipy.stats import mode
 
 import peakutils
 
-from quat import Quat
 import base
+from quat import Quat
 
 
 class Map(base.Map):
 
     def __init__(self, path, fname):
+        """Initialise class and import DIC data from file
+
+        Args:
+            path(str): Path to file
+            fname(str): Name of file including extension
+        """
+
         # Call base class constructor
         super(Map, self).__init__()
 
-        self.ebsdMap = None
-        self.ebsdTransform = None
-        self.ebsdShift = (0, 0)
+        print("Loading DIC data...", end="")
+
+        # Initialise variables
+        self.ebsdMap = None                 # EBSD map linked to DIC map
+        self.ebsdTransform = None           # Transform from EBSD to DIC coordinates
+        self.ebsdTransformInv = None        # Transform from DIC to EBSD coordinates
         self.grainList = None
-        self.currGrainId = None     # Id of last selected grain
-        # ...
+        self.currGrainId = None             # ID of last selected grain
         self.ebsdGrainIds = None
-        self.patternImPath = None   # Path to BSE image of map
-        self.windowSize = None      # Window size for map
+        self.patternImPath = None           # Path to BSE image of map
+        self.windowSize = None              # Window size for map
+        self.plotHomog = self.plotMaxShear  # Use max shear map for defining homologous points
+        self.highlightAlpha = 0.6
+        self.bseScale = None
+        self.path = path                    # file path
+        self.fname = fname                  # file name
 
-        self.plotDefault = self.plotMaxShear
+        # Load metadata
+        with open(self.path + self.fname, 'r') as f:
+            header = f.readline()
+        metadata = header.split()
 
-        self.path = path
-        self.fname = fname
-        # Load in data
-        self.data = np.loadtxt(self.path + self.fname, skiprows=1)
-        self.xc = self.data[:, 0]  # x coordinates
-        self.yc = self.data[:, 1]  # y coordinates
-        self.xd = self.data[:, 2]  # x displacement
-        self.yd = self.data[:, 3]  # y displacement
+        self.format = metadata[0].strip('#')    # Software name
+        self.version = metadata[1]              # Software version
+        self.binning = int(metadata[3])         # Sub-window width in pixels
+        self.xdimfile = int(metadata[5])        # size of map along x (from header)
+        self.ydimfile = int(metadata[4])        # size of map along y (from header)
+
+        # Load data
+
+        self.data = pd.read_table(self.path + self.fname, delimiter='\t', skiprows=1, header=None)
+        self.xc = self.data.values[:, 0]           # x coordinates
+        self.yc = self.data.values[:, 1]           # y coordinates
+        self.xd = self.data.values[:, 2]           # x displacement
+        self.yd = self.data.values[:, 3]           # y displacement
 
         # Calculate size of map
-        self.xdim = ((self.xc.max() - self.xc.min()) /
-                     min(abs((np.diff(self.xc)))) + 1)  # size of map along x
-        self.ydim = ((self.yc.max() - self.yc.min()) /
-                     max(abs((np.diff(self.yc)))) + 1)  # size of map along y
+        self.xdim = int((self.xc.max() - self.xc.min()) /
+                        min(abs((np.diff(self.xc)))) + 1)  # size of map along x
+        self.ydim = int((self.yc.max() - self.yc.min()) /
+                        max(abs((np.diff(self.yc)))) + 1)  # size of map along y
+
+        if (self.xdim != self.xdimfile) or (self.ydim != self.ydimfile):
+            raise Exception("Dimensions of data and header do not match")
 
         # *dim are full size of data. *Dim are size after cropping
         self.xDim = self.xdim
         self.yDim = self.ydim
 
-        self.x_map = self._map(self.xd)  # u (displacement component along x)
-        self.y_map = self._map(self.yd)  # v (displacement component along x)
-        self.f11 = self._grad(self.x_map)[1]  # f11
-        self.f22 = self._grad(self.y_map)[0]  # f22
-        self.f12 = self._grad(self.x_map)[0]  # f12
-        self.f21 = self._grad(self.y_map)[1]  # f21
+        self.x_map = self._map(self.xd)     # u (displacement component along x)
+        self.y_map = self._map(self.yd)     # v (displacement component along x)
+        xDispGrad = self._grad(self.x_map)
+        yDispGrad = self._grad(self.y_map)
+        self.f11 = xDispGrad[1] + 1         # f11
+        self.f22 = yDispGrad[0] + 1         # f22
+        self.f12 = xDispGrad[0]             # f12
+        self.f21 = yDispGrad[1]             # f21
 
         self.max_shear = np.sqrt((((self.f11 - self.f22) / 2.)**2) +
-                                 ((self.f12 + self.f21) / 2.)**2)  # max shear component
-        self.mapshape = np.shape(self.max_shear)
+                                 ((self.f12 + self.f21) / 2.)**2)   # max shear component
+        self.mapshape = np.shape(self.max_shear)                    # map shape
 
-        self.cropDists = np.array(((0, 0), (0, 0)), dtype=int)
+        self.cropDists = np.array(((0, 0), (0, 0)), dtype=int)      # crop distances (default all zeros)
+
+        print("\rLoaded {0} {1} data (dimensions: {2} x {3} pixels, sub-window size: {4} x {4} pixels)".
+              format(self.format, self.version, self.xdimfile, self.ydimfile, self.binning))
+
+    def plotDefault(self, *args, **kwargs):
+        self.plotMaxShear(plotGBs=True, *args, **kwargs)
 
     def _map(self, data_col):
-        data_map = np.reshape(np.array(data_col), (int(self.ydim), int(self.xdim)))
+        data_map = np.reshape(np.array(data_col), (self.ydim, self.xdim))
         return data_map
 
     def _grad(self, data_map):
@@ -73,18 +107,121 @@ class Map(base.Map):
         data_grad = np.gradient(data_map, grad_step, grad_step)
         return data_grad
 
-    def setCrop(self, xMin=None, xMax=None, yMin=None, yMax=None):
+    def retrieveName(self):
+        """
+        Gets the first name assigned to the a map, as a string
+
+        var(obj) variable to get name of
+        """
+        for fi in reversed(inspect.stack()):
+            names = [var_name for var_name, var_val in fi.frame.f_locals.items() if var_val is self]
+            if len(names) > 0:
+                return names[0]
+
+    def setScale(self, micrometrePerPixel):
+        """
+        Sets the scale of the map
+
+        micrometrePerPixel(float) length of pixel in original BSE image in micrometres
+        """
+        self.bseScale = micrometrePerPixel
+
+    @property
+    def strainScale(self):
+        return None if self.bseScale is None else self.bseScale * self.binning
+
+    def printStatsTable(self, percentiles, components):
+        """
+        Print out statistics table for a DIC map
+
+        percentiles(list) list of percentiles to print (number, Min, Mean or Max)
+        components(list of str) lis of map components to print i.e. f11, mss
+        """
+
+        # Print map info
+        print('\033[1m', end='')    # START BOLD
+        print("{0} (dimensions: {1} x {2} pixels, sub-window size: {3} x {3} pixels, number of points: {4})\n".format(
+            self.retrieveName(),
+            self.xdimfile,
+            self.ydimfile,
+            self.binning,
+            self.xdimfile * self.ydimfile
+        ))
+
+        # Print table header
+        print("Component\t".format(), end="")
+        for x in percentiles:
+            if x == 'Min' or x == 'Mean' or x == 'Max':
+                print("{0}\t".format(x), end='')
+            else:
+                print("P{0}\t".format(x), end='')
+        print('\033[0m', end='')    # END BOLD
+        print()
+
+        # Print table
+        for c in components:
+            selmap = []
+            if c == 'mss':
+                selmap = self.crop(self.max_shear) * 100
+            if c == 'f11':
+                selmap = (self.crop(self.f11) - 1) * 100
+            if c == 'f12':
+                selmap = self.crop(self.f12) * 100
+            if c == 'f21':
+                selmap = self.crop(self.f21) * 100
+            if c == 'f22':
+                selmap = (self.crop(self.f22) - 1) * 100
+            plist = []
+            for p in percentiles:
+                if p == 'Min':
+                    plist.append(np.min(selmap))
+                elif p == 'Mean':
+                    plist.append(np.mean(selmap))
+                elif p == 'Max':
+                    plist.append(np.max(selmap))
+                else:
+                    plist.append(np.percentile(selmap, p))
+            print("{0}\t\t".format(c), end="")
+            for l in plist:
+                print("{0:.2f}\t".format(l), end='')
+            print()
+        print()
+
+    def setCrop(self, xMin=None, xMax=None, yMin=None, yMax=None, updateHomogPoints=False):
+        """Set a crop for the DIC map
+
+        Args:
+            xMin(int): Distance to crop from left in pixels
+            xMax(int): Distance to crop from right in pixels
+            yMin(int): Distance to crop from top in pixels
+            yMax(int): Distance to crop from bottom in pixels
+            updateHomogPoints (bool, optional): Change homologous points to reflect crop
+        """
+        # changes in homog points
+        dx = 0
+        dy = 0
+
+        # update crop distances
         if xMin is not None:
+            if updateHomogPoints:
+                dx = self.cropDists[0, 0] - int(xMin)
             self.cropDists[0, 0] = int(xMin)
         if xMax is not None:
             self.cropDists[0, 1] = int(xMax)
         if yMin is not None:
+            if updateHomogPoints:
+                dy = self.cropDists[1, 0] - int(yMin)
             self.cropDists[1, 0] = int(yMin)
         if yMax is not None:
             self.cropDists[1, 1] = int(yMax)
 
-        self.xDim = int(self.xdim - xMin - xMax)
-        self.yDim = int(self.ydim - yMin - yMax)
+        # update homogo points if required
+        if updateHomogPoints and (dx != 0 or dy != 0):
+            self.updateHomogPoint(homogID=-1, delta=(dx, dy))
+
+        # set new cropped dimensions
+        self.xDim = self.xdim - self.cropDists[0, 0] - self.cropDists[0, 1]
+        self.yDim = self.ydim - self.cropDists[1, 0] - self.cropDists[1, 1]
 
     def crop(self, mapData, binned=True):
         if binned:
@@ -102,79 +239,125 @@ class Map(base.Map):
         # Set plot dafault to display selected image
         display = display.lower().replace(" ", "")
         if display == "bse" or display == "pattern":
-            self.plotDefault = self.plotPattern
+            self.plotHomog = self.plotPattern
             binSize = self.windowSize
         else:
-            self.plotDefault = self.plotMaxShear
+            self.plotHomog = self.plotMaxShear
             binSize = 1
 
         # Call set homog points from base class setting the bin size
-        super(Map, self).setHomogPoint(binSize=binSize)
+        super(type(self), self).setHomogPoint(binSize=binSize)
 
-    def linkEbsdMap(self, ebsdMap):
+    def linkEbsdMap(self, ebsdMap, transformType="affine", order=2):
+        """Calculates the transformation required to align EBSD dataset to DIC
+
+        Args:
+            ebsdMap(ebsd.Map): EBSD map object to link
+            transformType(string, optional): affine, piecewiseAffine or polynomial
+            order(int, optional): Order of polynomial transform to apply
+        """
+        print("Linking EBSD <-> DIC...", end="")
+
         self.ebsdMap = ebsdMap
-        self.ebsdTransform = tf.AffineTransform()
+        if transformType == "piecewiseAffine":
+            self.ebsdTransform = tf.PiecewiseAffineTransform()
+            self.ebsdTransformInv = self.ebsdTransform.inverse
+        elif transformType == "polynomial":
+            self.ebsdTransform = tf.PolynomialTransform()
+            # You can't calculate the inverse of a polynomial transform so have to estimate
+            # by swapping source and destination homog points
+            self.ebsdTransformInv = tf.PolynomialTransform()
+            self.ebsdTransformInv.estimate(np.array(self.ebsdMap.homogPoints), np.array(self.homogPoints), order=order)
+            # calculate transform from EBSD to DIC frame
+            self.ebsdTransform.estimate(np.array(self.homogPoints), np.array(self.ebsdMap.homogPoints), order=order)
+            return
+        else:
+            self.ebsdTransform = tf.AffineTransform()
+            self.ebsdTransformInv = self.ebsdTransform.inverse
+
         # calculate transform from EBSD to DIC frame
         self.ebsdTransform.estimate(np.array(self.homogPoints), np.array(self.ebsdMap.homogPoints))
 
-    def setEbsdShift(self, xShift=None, yShift=None):
-        if xShift is None:
-            xShift = self.ebsdShift[0]
-        if yShift is None:
-            yShift = self.ebsdShift[1]
+        print("\r", end="")
 
-        self.ebsdShift = (xShift, yShift)
+    def checkEbsdLinked(self):
+        """Check if an EBSD map has been linked.
 
-    def warpToDicFrame(self, mapData, cropImage=True):
-        # calculate transform from EBSD to DIC frame
-        # self.ebsdTransform.estimate(np.array(self.homogPoints), np.array(self.ebsdMap.homogPoints))
+        Returns:
+            bool: Returns True if EBSD map linked
 
-        if cropImage:
+        Raises:
+            Exception: if EBSD map not linked
+        """
+        if self.ebsdMap is None:
+            raise Exception("No EBSD map linked.")
+        return True
+
+    def warpToDicFrame(self, mapData, cropImage=True, order=1, preserve_range=False):
+        """Warps a map to the DIC frame
+
+        Returns:
+            warpedMap: Map (i.e. EBSD map) warped to the DIC frame
+
+        Args:
+            mapData(map): data to warp
+            cropImage(bool, optional):
+            order(int, optional): order of interpolation (0: Nearest-neighbor, 1: Bi-linear...)
+            preserve_range(bool, optional): keep the original range of values
+        """
+        # Check a EBSD map is linked
+        self.checkEbsdLinked()
+
+        if (cropImage or type(self.ebsdTransform) is not tf.AffineTransform):
             # crop to size of DIC map
-            outputShape = (self.yDim + self.ebsdShift[1], self.xDim + self.ebsdShift[0])
+            outputShape = (self.yDim, self.xDim)
             # warp the map
-            warpedMap = tf.warp(mapData, self.ebsdTransform, output_shape=outputShape)
-            # return map with shift
-            return warpedMap[self.ebsdShift[1]:, self.ebsdShift[0]:]
+            warpedMap = tf.warp(mapData, self.ebsdTransform, output_shape=outputShape, order=order, preserve_range=preserve_range)
         else:
             # copy ebsd transform and change translation to give an extra 5% border
             # to show the entire image after rotation/shearing
             tempEbsdTransform = tf.AffineTransform(matrix=np.copy(self.ebsdTransform.params))
             tempEbsdTransform.params[0:2, 2] = -0.05 * np.array(mapData.shape)
 
-            # output the entire warped image with 5% border
-            outputShape = np.array(mapData.shape) * 1.1 / tempEbsdTransform.scale
+            # output the entire warped image with 5% border (add some extra to fix a bug)
+            outputShape = np.array(mapData.shape) * 1.4 / tempEbsdTransform.scale
 
             # warp the map
-            warpedMap = tf.warp(mapData, tempEbsdTransform, output_shape=outputShape.astype(int))
+            warpedMap = tf.warp(mapData, tempEbsdTransform, output_shape=outputShape.astype(int), order=order, preserve_range=preserve_range)
 
-            return warpedMap
+        # return map
+        return warpedMap
 
     @property
     def boundaries(self):
+        # Check a EBSD map is linked
+        self.checkEbsdLinked()
+
+        # image is returned cropped if a piecewise transform is being used
         boundaries = self.warpToDicFrame(-self.ebsdMap.boundaries.astype(float), cropImage=False) > 0.1
 
         boundaries = mph.skeletonize(boundaries)
         mph.remove_small_objects(boundaries, min_size=10, in_place=True, connectivity=2)
 
-        # need to apply the translation of ebsd transform and remove 5% border
-        crop = np.copy(self.ebsdTransform.params[0:2, 2])
-        crop += 0.05 * np.array(self.ebsdMap.boundaries.shape)
-        # the crop is defined in EBSD coords so need to transform it
-        transformMatrix = np.copy(self.ebsdTransform.params[0:2, 0:2])
-        crop = np.matmul(np.linalg.inv(transformMatrix), crop)
+        # crop image if it is a simple affine transform
+        if type(self.ebsdTransform) is tf.AffineTransform:
+            # need to apply the translation of ebsd transform and remove 5% border
+            crop = np.copy(self.ebsdTransform.params[0:2, 2])
+            crop += 0.05 * np.array(self.ebsdMap.boundaries.shape)
+            # the crop is defined in EBSD coords so need to transform it
+            transformMatrix = np.copy(self.ebsdTransform.params[0:2, 0:2])
+            crop = np.matmul(np.linalg.inv(transformMatrix), crop)
+            crop = crop.round().astype(int)
 
-        crop = crop.round().astype(int) + np.array(self.ebsdShift)
-
-        boundaries = boundaries[crop[1]:crop[1] + self.yDim + self.ebsdShift[1],
-                                crop[0]:crop[0] + self.xDim + self.ebsdShift[0]]
+            boundaries = boundaries[crop[1]:crop[1] + self.yDim,
+                                    crop[0]:crop[0] + self.xDim]
 
         boundaries = -boundaries.astype(int)
 
         return boundaries
 
     def setPatternPath(self, filePath, windowSize):
-        """Set path of BSE of pattern. filePath is relative to the path set when constructing."""
+        """Set path of BSE image of pattern. filePath is relative to the path set when constructing."""
 
         self.patternImPath = self.path + filePath
         self.windowSize = windowSize
@@ -193,128 +376,285 @@ class Map(base.Map):
         else:
             raise Exception("First set path to pattern image.")
 
-    def plotMaxShear(self, plotGBs=False, plotSlipTraces=False, plotPercent=True, vMax=0.5,
-                     updateCurrent=False, highlightGrains=None, plotColourBar=False,
-                     saveFig=False,saveFile=None,dpi=None,title=None,plotAxis="on"):
-        
+    def plotGrainNumbers(self, dilate=False):
+        """Plot a map with grains numbered
+
+        Args:
+            dilate(bool, optional): Set to true to dilate boundaries by one pixel
+        """
+
+        self.fig, self.ax = plt.subplots()
+
+        for grainID in range(0, len(self.grainList)):
+            xmiddle = (self.grainList[grainID].extremeCoords[2] + self.grainList[grainID].extremeCoords[0]) / 2
+            ymiddle = (self.grainList[grainID].extremeCoords[3] + self.grainList[grainID].extremeCoords[1]) / 2
+            self.ax.text(xmiddle, ymiddle, grainID, fontsize=10)
+
+        self.plotGBs(ax=self.ax, colour='black', dilate=dilate)
+
+    def plotMaxShear(self, plotGBs=False, dilateBoundaries=False, boundaryColour='white', plotSlipTraces=False, plotPercent=False,
+                     scaleBar=False, updateCurrent=False, highlightGrains=None, highlightColours=None,
+                     plotColourBar=False, vmin=None, vmax=None):
+        """Plot a map of maximum shear strain
+
+        Args:
+            plotGBs(bool, optional): Set to true to overlay grain boundaries
+            dilateBoundaries(bool, optional): Set to true to dilate boundaries by one pixel
+            boundaryColour(string, optional): Colour of boundaries
+            plotSlipTraces(bool, optional): Set to true to plot slip traces for each grain
+            plotPercent(bool, optional): Set to true to plot maps using percentage
+            plotColourBar(bool, optional): Set to true to plot colour bar
+            vmin(bool, optional): Minimum value to plot
+            vmax(bool, optional): Maximum value to plot
+        """
         if not updateCurrent:
             # self.fig, self.ax = plt.subplots(figsize=(5.75, 4))
             self.fig, self.ax = plt.subplots()
 
         multiplier = 100 if plotPercent else 1
-        if plotPercent:
-            img = self.ax.imshow(self.crop(self.max_shear) * multiplier,
-                             cmap='viridis', interpolation='None', vmin=0, vmax=10)
-        else:
-            img = self.ax.imshow(self.crop(self.max_shear) * multiplier,
-                             cmap='viridis', interpolation='None', vmin=0, vmax=vMax)
+        img = self.ax.imshow(self.crop(self.max_shear) * multiplier,
+                             cmap='viridis', interpolation='None', vmin=vmin, vmax=vmax)
         if plotColourBar:
             if plotPercent:
-                plt.colorbar(img, ax=self.ax, label="Effective shear strain (%)", shrink = 0.75)
-            else:
-               plt.colorbar(img, ax=self.ax, label="HRDIC $\epsilon_{eff}$ [ ]", shrink = 0.75)
+                plt.colorbar(img, ax=self.ax, label="Effective shear strain (%)")
+            plt.colorbar(img, ax=self.ax, label="Effective shear strain")
 
         if plotGBs:
-            cmap1 = mpl.colors.LinearSegmentedColormap.from_list('my_cmap', ['white', 'white'], 256)
-            cmap1._init()
-            cmap1._lut[:, -1] = np.linspace(0, 1, cmap1.N + 3)
-
-            self.ax.imshow(-self.boundaries, cmap=cmap1, interpolation='None', vmin=0, vmax=1)
+            self.plotGBs(ax=self.ax, colour=boundaryColour, dilate=dilateBoundaries)
 
         if highlightGrains is not None:
-            self.highlightGrains(highlightGrains)
+            self.highlightGrains(highlightGrains, highlightColours)
 
-        # plot slip traces
-        if plotSlipTraces:
-            numGrains = len(self.grainList)
-            numSS = len(self.ebsdMap.slipSystems)
-            grainSizeData = np.zeros((numGrains, 4))
-            slipTraceData = np.zeros((numGrains, numSS, 2))
-
-            i = 0   # keep track of number of slip traces
-            for grain in self.grainList:
-                if len(grain) < 1000:
-                    continue
-
-                # x0, y0, xmax, ymax
-                grainSizeData[i, 0], grainSizeData[i, 1], grainSizeData[i, 2], grainSizeData[i, 3] = grain.extremeCoords()
-
-                for j, slipTrace in enumerate(grain.slipTraces()):
-                    slipTraceData[i, j, 0:2] = slipTrace[0:2]
-
-                i += 1
-
-            grainSizeData = grainSizeData[0:i, :]
-            slipTraceData = slipTraceData[0:i, :, :]
-
-            scale = 4 / ((grainSizeData[:, 2] - grainSizeData[:, 0]) / self.xDim +
-                         (grainSizeData[:, 3] - grainSizeData[:, 1]) / self.xDim)
-
-            xPos = grainSizeData[:, 0] + (grainSizeData[:, 2] - grainSizeData[:, 0]) / 2
-            yPos = grainSizeData[:, 1] + (grainSizeData[:, 3] - grainSizeData[:, 1]) / 2
-
-            colours = ["white", "green", "red", "black"]
-
-            for i, colour in enumerate(colours[0:numSS]):
-                self.ax.quiver(xPos, yPos, slipTraceData[:, i, 0], slipTraceData[:, i, 1],
-                               scale=scale, pivot="middle", color=colour, headwidth=1,
-                               headlength=0, width=0.002)
-        if saveFig:
-            plt.title(title)
-            plt.axis(plotAxis)
-            plt.savefig(saveFile,dpi=dpi,bbox_inches='tight')
-            
-        return
-
-    def highlightGrains(self, grainIds):
-        outline = np.zeros((self.yDim, self.xDim), dtype=int)
-        for grainId in grainIds:
-            # outline of highlighted grain
-            grainOutline = self.grainList[grainId].grainOutline(bg=0, fg=1)
-            x0, y0, xmax, ymax = self.grainList[grainId].extremeCoords()
-
-            # use logical of same are in entire area to ensure neigbouring grains display correctly
-            grainOutline = np.logical_or(outline[y0:ymax + 1, x0:xmax + 1], grainOutline).astype(int)
-            outline[y0:ymax + 1, x0:xmax + 1] = grainOutline
-
-        # Custom colour map where 0 is tranparent white for bg and 255 is opaque white for fg
-        cmap1 = mpl.colors.LinearSegmentedColormap.from_list('my_cmap', ['green', 'green'], 256)
-        cmap1._init()
-        cmap1._lut[:, -1] = np.linspace(0, 0.6, cmap1.N + 3)
-
-        # plot highlighted grain overlay
-        self.ax.imshow(outline, interpolation='none', vmin=0, vmax=1, cmap=cmap1)
-
-        return
-
-    def locateGrainID(self, clickEvent=None, displaySelected=False):
-        if (self.grainList is not None) and (self.grainList != []):
-            # reset current selected grain and plot max shear map with click handler
-            self.currGrainId = None
-            self.plotMaxShear(plotGBs=True)
-            if clickEvent is None:
-                # default click handler which highlights grain and prints id
-                self.fig.canvas.mpl_connect('button_press_event', lambda x: self.clickGrainId(x, displaySelected))
+        if scaleBar:
+            if self.strainScale is None:
+                raise Exception("First set image scale using setScale")
             else:
-                # click handler loaded in as parameter. Pass current map object to it.
-                self.fig.canvas.mpl_connect('button_press_event', lambda x: clickEvent(x, self))
+                scalebar = ScaleBar(self.strainScale * (1e-6))  # 1 pixel = 0.2 meter
+                plt.gca().add_artist(scalebar)
 
-            # unset figure for plotting grains
-            self.grainFig = None
-            self.grainAx = None
+        # # plot slip traces
+        # if plotSlipTraces:
+        #     # Check that grains have been detected in the map
+        #     self.checkGrainsDetected()
 
+        #     numGrains = len(self.grainList)
+        #     numSS = len(self.ebsdMap.slipSystems)
+        #     grainSizeData = np.zeros((numGrains, 4))
+        #     slipTraceData = np.zeros((numGrains, numSS, 2))
+
+        #     i = 0   # keep track of number of slip traces
+        #     for grain in self.grainList:
+        #         if len(grain) < 1000:
+        #             continue
+
+        #         # x0, y0, xmax, ymax
+        #         grainSizeData[i, 0], grainSizeData[i, 1], grainSizeData[i, 2], grainSizeData[i, 3] = grain.extremeCoords
+
+        #         for j, slipTrace in enumerate(grain.slipTraces()):
+        #             slipTraceData[i, j, 0:2] = slipTrace[0:2]
+
+        #         i += 1
+
+        #     grainSizeData = grainSizeData[0:i, :]
+        #     slipTraceData = slipTraceData[0:i, :, :]
+
+        #     scale = 4 / ((grainSizeData[:, 2] - grainSizeData[:, 0]) / self.xDim +
+        #                  (grainSizeData[:, 3] - grainSizeData[:, 1]) / self.xDim)
+
+        #     xPos = grainSizeData[:, 0] + (grainSizeData[:, 2] - grainSizeData[:, 0]) / 2
+        #     yPos = grainSizeData[:, 1] + (grainSizeData[:, 3] - grainSizeData[:, 1]) / 2
+
+        #     colours = self.ebsdMap.slipTraceColours
+
+        #     for i, colour in enumerate(colours[0:numSS]):
+        #         self.ax.quiver(xPos, yPos, slipTraceData[:, i, 0], slipTraceData[:, i, 1],
+        #                        scale=scale, pivot="middle", color=colour, headwidth=1,
+        #                        headlength=0, width=0.002)
+
+        return
+
+    def plotGrainAvMaxShear(self, plotGBs=False, plotColourBar=True, vmin=None, vmax=None, clabel=''):
+        """Plot grain map with grains filled with average value of max shear.
+        This uses the max shear values stored in grain objects, to plot other data
+        use plotGrainAv().
+
+        Args:
+            plotGBs (bool, optional): Set to True to draw grain boundaries
+            plotColourBar (bool, optional): Set to Flase to exclude the colour bar
+            vmin (float, optional): Minimum value of colour scale
+            vmax (float, optional): Maximum value for colour scale
+            clabel (str, optional): Colour bar label text
+        """
+        # Check that grains have been detected in the map
+        self.checkGrainsDetected()
+
+        plt.figure()
+
+        grainAvMaxShear = np.zeros([self.yDim, self.xDim])
+
+        for grain in self.grainList:
+            avMaxShear = np.array(grain.maxShearList).mean()
+
+            for coord in grain.coordList:
+                grainAvMaxShear[coord[1], coord[0]] = avMaxShear
+
+        plt.imshow(grainAvMaxShear * 100, vmin=vmin, vmax=vmin)
+
+        if plotColourBar:
+                plt.colorbar(label="Effective shear strain (%)")
+
+        if plotGBs:
+            self.plotGBs()
+
+    def calcGrainAv(self, mapData):
+        """Calculate grain average of any DIC map data.
+
+        Args:
+            mapData (np.array): Array of map data to grain average. This must be cropped!
+
+        Returns:
+            np.array: Array containing the grain average values
+        """
+        # Check that grains have been detected in the map
+        self.checkGrainsDetected()
+
+        grainAvData = np.zeros(len(self))
+
+        for grainId, grain in enumerate(self.grainList):
+            grainData = grain.grainData(mapData)
+            grainAvData[grainId] = grainData.mean()
+
+        return grainAvData
+
+    def plotGrainAv(self, mapData, plotGBs=False, plotColourBar=True, vmin=None, vmax=None, clabel=''):
+        """Plot grain map with grains filled with average value of from any DIC map data
+
+        Args:
+            mapData (np.array): Array of map data to grain average. This must be cropped!
+            plotGBs (bool, optional): Set to True to draw grain boundaries
+            plotColourBar (bool, optional): Set to Flase to exclude the colour bar
+            vmin (float, optional): Minimum value of colour scale
+            vmax (float, optional): Maximum value for colour scale
+            clabel (str, optional): Colour bar label text
+        """
+
+        grainAvData = self.calcGrainAv(mapData)
+
+        self.plotGrainData(
+            grainAvData,
+            grainIds=-1,
+            plotGBs=plotGBs,
+            plotColourBar=plotColourBar,
+            vmin=vmin,
+            vmax=vmax,
+            clabel=clabel
+        )
+
+    def plotGrainData(self, grainData, grainIds=-1, bg=0, ax=None, plotGBs=False, plotColourBar=True, cmap=None, vmin=None, vmax=None, clabel=''):
+        """Plot grain map with grains filled with average value of from any DIC map data
+
+        Args:
+            grainData (np.array): Data value for each grain
+            grainIds (iterable): Grain IDs of each grain to plot, -1 for all grains
+            bg (float, optional): Background value for areas with no grain data.
+            plotGBs (bool, optional): Set to True to draw grain boundaries
+            plotColourBar (bool, optional): Set to Flase to exclude the colour bar
+            cmap (str, optional): Colour map to use
+            vmin (float, optional): Minimum value of colour scale
+            vmax (float, optional): Maximum value for colour scale
+            clabel (str, optional): Colour bar label text
+        """
+        # Check that grains have been detected in the map
+        self.checkGrainsDetected()
+
+        if type(grainIds) is int and grainIds == -1:
+            grainIds = range(len(self))
+
+        if len(grainData) != len(grainIds):
+            raise Exception("Must be 1 value for each grain in grainData.")
+
+        grainMap = np.full([self.yDim, self.xDim], bg, dtype=grainData.dtype)
+        for grainId, grainValue in zip(grainIds, grainData):
+            grain = self.grainList[grainId]
+            for coord in grain.coordList:
+                grainMap[coord[1], coord[0]] = grainValue
+
+        if ax is None:
+            plt.figure()
+            ax = plt.gca()
+
+        im = ax.imshow(grainMap, vmin=vmin, vmax=vmax, cmap=cmap)
+
+        if plotColourBar:
+            plt.colorbar(im, ax=ax, label=clabel)
+
+        if plotGBs:
+            self.plotGBs()
+
+    def plotGrainAvIPF(self, mapData, direction, ax=None, plotColourBar=True, vmin=None, vmax=None, clabel=''):
+        """Plot IPF of grain reference (average) orientations with points coloured
+        by grain average values from map data.
+
+        Args:
+            mapData (np.array): Array of map data to grain average. This must be cropped!
+            direction (np.array): Vector of reference direction for the IPF
+            plotColourBar (bool, optional): Set to Flase to exclude the colour bar
+            vmin (float, optional): Minimum value of colour scale
+            vmax (float, optional): Maximum value for colour scale
+            clabel (str, optional): Colour bar label text
+        """
+        # Check that grains have been detected in the map
+        self.checkGrainsDetected()
+
+        plt.figure()
+        grainAvData = self.calcGrainAv(mapData)
+
+        grainOri = np.empty(len(self), dtype=Quat)
+
+        for grainId, grain in enumerate(self.grainList):
+            grainOri[grainId] = grain.ebsdGrain.refOri
+
+        if ax is None:
+            plt.figure()
+            ax = plt.gca()
+
+        Quat.plotIPF(grainOri, direction, self.ebsdMap.crystalSym, ax=ax,
+                     c=grainAvData, marker='o', vmin=vmin, vmax=vmax)
+
+        if plotColourBar:
+            plt.colorbar(label=clabel)
+
+    def locateGrainID(self, clickEvent=None, displaySelected=False, **kwargs):
+        # Check that grains have been detected in the map
+        self.checkGrainsDetected()
+
+        # reset current selected grain and plot max shear map with click handler
+        self.currGrainId = None
+        self.plotMaxShear(plotGBs=True, **kwargs)
+        if clickEvent is None:
+            # default click handler which highlights grain and prints id
+            self.fig.canvas.mpl_connect(
+                'button_press_event',
+                lambda x: self.clickGrainId(x, displaySelected, **kwargs)
+            )
         else:
-            raise Exception("Grain list empty")
+            # click handler loaded in as parameter. Pass current map object to it.
+            self.fig.canvas.mpl_connect('button_press_event', lambda x: clickEvent(x, self))
 
-    def clickGrainId(self, event, displaySelected):
+        # unset figure for plotting grains
+        self.grainFig = None
+        self.grainAx = None
+
+    def clickGrainId(self, event, displaySelected, **kwargs):
         if event.inaxes is not None:
             # grain id of selected grain
             self.currGrainId = int(self.grains[int(event.ydata), int(event.xdata)] - 1)
-            print(self.currGrainId)
+            print("Grain ID: {}".format(self.currGrainId))
 
             # clear current axis and redraw map with highlighted grain overlay
             self.ax.clear()
-            self.plotMaxShear(plotGBs=True, updateCurrent=True, highlightGrains=[self.currGrainId])
+            self.plotMaxShear(plotGBs=True, updateCurrent=True, highlightGrains=[self.currGrainId],
+                              highlightColours=['green'], **kwargs)
             self.fig.canvas.draw()
 
             if displaySelected:
@@ -324,10 +664,16 @@ class Map(base.Map):
                 self.grainAx.clear()
                 self.grainList[self.currGrainId].plotMaxShear(plotSlipTraces=True,
                                                               plotShearBands=True,
-                                                              ax=self.grainAx)
+                                                              ax=self.grainAx,
+                                                              **kwargs)
                 self.grainFig.canvas.draw()
 
     def findGrains(self, minGrainSize=10):
+        print("Finding grains in DIC map...", end="")
+
+        # Check a EBSD map is linked
+        self.checkEbsdLinked()
+
         # Initialise the grain map
         self.grains = np.copy(self.boundaries)
 
@@ -357,14 +703,9 @@ class Map(base.Map):
             unknownPoints = np.where(self.grains == 0)
 
         # Now link grains to those in ebsd Map
-        # Warp DIC grain map to EBSD frame, accounting for shift (only positive)
+        # Warp DIC grain map to EBSD frame
         dicGrains = self.grains
-        if self.ebsdShift[1] != 0:
-            dicGrains = np.vstack([np.zeros((self.ebsdShift[1], dicGrains.shape[1])), dicGrains])
-        if self.ebsdShift[0] != 0:
-            dicGrains = np.hstack([np.zeros((dicGrains.shape[0], self.ebsdShift[0])), dicGrains])
-
-        warpedDicGrains = tf.warp(dicGrains.astype(float), self.ebsdTransform.inverse,
+        warpedDicGrains = tf.warp(dicGrains.astype(float), self.ebsdTransformInv,
                                   output_shape=(self.ebsdMap.yDim, self.ebsdMap.xDim), order=0).astype(int)
 
         # Initalise list to store ID of corresponding grain in EBSD map. Also stored in grain objects
@@ -378,7 +719,9 @@ class Map(base.Map):
             self.ebsdGrainIds.append(modeId[0] - 1)
             self.grainList[i].ebsdGrainId = modeId[0] - 1
             self.grainList[i].ebsdGrain = self.ebsdMap.grainList[modeId[0] - 1]
+            self.grainList[i].ebsdMap = self.ebsdMap
 
+        print("\r", end="")
         return
 
     def floodFill(self, x, y, grainIndex):
@@ -431,54 +774,27 @@ class Map(base.Map):
                 edge = newedge
 
 
-class Grain(object):
+class Grain(base.Grain):
+
     def __init__(self, dicMap):
+        # Call base class constructor
+        super(Grain, self).__init__()
+
         self.dicMap = dicMap       # dic map this grain is a member of
-        self.coordList = []         # list of coords stored as tuples (x, y)
         self.maxShearList = []
         self.ebsdGrain = None
-        return
-
-    def __len__(self):
-        return len(self.coordList)
+        self.ebsdMap = None
 
     # coord is a tuple (x, y)
     def addPoint(self, coord, maxShear):
         self.coordList.append(coord)
         self.maxShearList.append(maxShear)
-        return
-
-    def extremeCoords(self):
-        unzippedCoordlist = list(zip(*self.coordList))
-        x0 = min(unzippedCoordlist[0])
-        y0 = min(unzippedCoordlist[1])
-        xmax = max(unzippedCoordlist[0])
-        ymax = max(unzippedCoordlist[1])
-        return x0, y0, xmax, ymax
-
-    def grainOutline(self, bg=np.nan, fg=0):
-        x0, y0, xmax, ymax = self.extremeCoords()
-
-        # initialise array with nans so area not in grain displays white
-        outline = np.full((ymax - y0 + 1, xmax - x0 + 1), bg, dtype=int)
-
-        for coord in self.coordList:
-            outline[coord[1] - y0, coord[0] - x0] = fg
-
-        return outline
-
-    def plotOutline(self):
-        plt.figure()
-        plt.imshow(self.grainOutline(), interpolation='none')
-        plt.colorbar()
-        return
 
     def plotMaxShear(self, plotPercent=True, plotSlipTraces=False, plotShearBands=False,
-                     vmin=None, vmax=None, cmap="viridis", ax=None,
-                     saveFig=False,saveFile=None,dpi=None,title=None,plotAxis="on"):
-        
+                     vmin=None, vmax=None, cmap="viridis", ax=None):
+
         multiplier = 100 if plotPercent else 1
-        x0, y0, xmax, ymax = self.extremeCoords()
+        x0, y0, xmax, ymax = self.extremeCoords
 
         # initialise array with nans so area not in grain displays white
         grainMaxShear = np.full((ymax - y0 + 1, xmax - x0 + 1), np.nan, dtype=float)
@@ -489,10 +805,7 @@ class Grain(object):
         if ax is None:
             plt.figure()
             plt.imshow(grainMaxShear * multiplier, interpolation='none', vmin=vmin, vmax=vmax, cmap=cmap)
-            if plotPercent:
-                plt.colorbar(label="Effective shear strain (%)", shrink = 0.75)
-            else:
-               plt.colorbar(label="HRDIC $\epsilon_{eff}$ [ ]", shrink = 0.75)
+            plt.colorbar(label="Effective shear strain (%)")
             plt.xticks([])
             plt.yticks([])
         else:
@@ -500,152 +813,73 @@ class Grain(object):
             # ax.colorbar()
 
         if plotSlipTraces:
-            if self.slipTraces() is None:
-                raise Exception("First calculate slip traces")
-
-            colours = ["white", "green", "red", "black"]
-            xPos = int((xmax - x0) / 2)
-            yPos = int((ymax - y0) / 2)
-            for slipTrace, colour in zip(self.slipTraces(), colours):
-                if ax is None:
-                    plt.quiver(xPos, yPos, slipTrace[0], slipTrace[1], scale=1, pivot="middle",
-                               color=colour, headwidth=1, headlength=0)
-                else:
-                    ax.quiver(xPos, yPos, slipTrace[0], slipTrace[1], scale=1, pivot="middle",
-                              color=colour, headwidth=1, headlength=0)
+            self.plotSlipTraces(ax=ax)
 
         if plotShearBands:
-            grainMaxShear = np.nan_to_num(grainMaxShear)
+            self.plotShearBands(grainMaxShear, ax=ax)
 
-            sin_map = tf.radon(grainMaxShear)
-            profile = np.max(sin_map, axis=0)
-
-            x = np.arange(180)
-            y = profile
-
-            indexes = peakutils.indexes(y, thres=0.5, min_dist=30)
-            peaks = peakutils.interpolate(x, y, ind=indexes)
-            print("Number of bands detected: {:}".format(len(peaks)))
-
-            shearBandAngles = peaks
-            shearBandAngles = -shearBandAngles * np.pi / 180
-            shearBandVectors = np.array((np.sin(shearBandAngles), np.cos(shearBandAngles)))
-
-            xPos = int((xmax - x0) / 2)
-            yPos = int((ymax - y0) / 2)
-
-            if ax is None:
-                plt.quiver(xPos, yPos, shearBandVectors[0], shearBandVectors[1], scale=1, pivot="middle",
-                           color='yellow', headwidth=1, headlength=0)
-            else:
-                ax.quiver(xPos, yPos, shearBandVectors[0], shearBandVectors[1], scale=1, pivot="middle",
-                          color='yellow', headwidth=1, headlength=0)
-        if saveFig:
-            plt.title(title)
-            plt.axis(plotAxis)
-            plt.savefig(saveFile,dpi=dpi,bbox_inches='tight')                     
-
-        return
-
-    def slipTraces(self, correctAvOri=False):
-        if correctAvOri:
-            # need to correct slip traces due to warping of map
-            return self.ebsdGrain.slipTraces
-        else:
-            return self.ebsdGrain.slipTraces
+    @property
+    def slipTraces(self):
+        return self.ebsdGrain.slipTraces
 
     def calcSlipTraces(self, slipSystems=None):
         self.ebsdGrain.calcSlipTraces(slipSystems=slipSystems)
 
-    # def calcSlipTraces(self, correctAvOri=False):
+    def calcSlipBands(self, grainMapData, thres=0.3, min_dist=30):
+        """Use Radon transform to detect slip band angles
 
-    #     if correctAvOri:
-    #         # transformRotation = Quat(-DicMap.ebsdTransform.rotation, 0, 0)
-    #         transformRotation = Quat(0.1329602509925417, 0, 0)
-    #         grainAvOri = grainAvOri * transformRotation
+        Args:
+            grainMapData (numpy.array): Data to find bands in
+            thres (float, optional): Normalised threshold for peaks
+            min_dist (int, optional): Minimum angle between bands
 
-    
-    def findSlipBands(self,c_range=[], cropXMin=0,cropXMax=-1,cropYMin=0,cropYMax=-1,strainMin=0):
+        Returns:
+            list(float): Detected slip band angles
+        """
+        grainMapData = np.nan_to_num(grainMapData)
 
-        x0, y0, xmax, ymax = self.extremeCoords()
+        if grainMapData.min() < 0:
+            print("Negeative values in data, taking absolute value.")
+            # grainMapData = grainMapData**2
+            grainMapData = np.abs(grainMapData)
 
-        # initialise array with nans so area not in grain displays white
-        grainMaxShear = np.full((ymax - y0 + 1, xmax - x0 + 1), np.nan, dtype=float)
+        sin_map = tf.radon(grainMapData, circle=False)
+        profile = np.max(sin_map, axis=0)
 
-        for coord, maxShear in zip(self.coordList, self.maxShearList):
-            grainMaxShear[coord[1] - y0, coord[0] - x0] = maxShear  
+        x = np.arange(180)
 
-        image = np.nan_to_num(grainMaxShear[cropXMin:cropXMax,cropYMin:cropYMax])
+        indexes = peakutils.indexes(profile, thres=thres, min_dist=min_dist)
+        peaks = x[indexes]
+        # peaks = peakutils.interpolate(x, profile, ind=indexes)
+        print("Number of bands detected: {:}".format(len(peaks)))
 
-        imageTemp = []
-        for i in image:
-            for j in i:
-                if j < strainMin:
-                    j = 0
-                imageTemp.append(j)
-        image = np.reshape(imageTemp,(np.shape(image)))
+        slipBandAngles = peaks
+        slipBandAngles = slipBandAngles * np.pi / 180
 
-        plt.imshow(image,vmax=0.05)
+        return slipBandAngles
 
+    def plotSlipBands(self, grainMapData, ax=None, thres=0.3, min_dist=30, slipBandAngles=None):
+        if slipBandAngles is None:
+            slipBandAngles = self.calcSlipBands(grainMapData, thres=thres, min_dist=min_dist)
+        slipBandVectors = np.array((-np.sin(slipBandAngles), np.cos(slipBandAngles)))
 
-    #     # calculate the fft
-    #     acorr=(np.fft.fft2(image)*np.conjugate(np.fft.fft2(image)))
-    #     ashift=np.fft.fftshift(acorr)
-    #     corr_map=np.log(np.fft.fftshift((np.abs(np.fft.ifft2(ashift)))))
-    #     if c_range==[]:
-    #         plt.imshow(corr_map, interpolation='nearest', cmap='viridis');
-    #     else:
-    #         plt.imshow(corr_map, interpolation='nearest', cmap='viridis',
-    #                    vmin=c_range[0], vmax=c_range[1]);
+        xPos, yPos = self.centreCoords
 
+        if ax is None:
+            plt.quiver(
+                xPos, yPos,
+                slipBandVectors[0], slipBandVectors[1],
+                scale=1, pivot="middle",
+                color='yellow', headwidth=1,
+                headlength=0
+            )
+        else:
+            ax.quiver(
+                xPos, yPos,
+                slipBandVectors[0], slipBandVectors[1],
+                scale=1, pivot="middle",
+                color='yellow', headwidth=1,
+                headlength=0
+            )
 
-    #      # run an fft filter
-    #     strain_map_fft=np.fft.fft2(image)
-    #     cut=0
-    #     lcut=int(np.shape(strain_map_fft)[0]/2-cut)
-    #     rcut=int(np.shape(strain_map_fft)[0]/2+cut)
-    #     tcut=int(np.shape(strain_map_fft)[1]/2-cut)
-    #     bcut=int(np.shape(strain_map_fft)[1]/2+cut)
-    #     strain_map_fft[lcut:rcut,tcut:bcut]=0
-
-    #     plt.imshow((np.abs(strain_map_fft)),cmap='viridis',vmax=10)
-
-    #     filt_image=np.abs(np.fft.ifft2(strain_map_fft))
-    #     plt.imshow(filt_image,cmap='viridis', vmax=0.03)
-    #     plt.colorbar()
-
-    
-        # run the Hough transform
-        from skimage.transform import (hough_line, hough_line_peaks, probabilistic_hough_line)
-        from matplotlib import cm
-        h, theta, d = hough_line(image)
-
-        # Generating figure 1
-        fig, axes = plt.subplots(1, 3, figsize=(15, 6),
-                                 subplot_kw={'adjustable': 'box-forced'})
-        ax = axes.ravel()
-
-        ax[0].imshow(image, cmap=cm.gray)
-        ax[0].set_title('Input image')
-        ax[0].set_axis_off()
-
-        ax[1].imshow(np.log(1 + h),
-                     extent=[np.rad2deg(theta[-1]), np.rad2deg(theta[0]), d[-1], d[0]],
-                     cmap=cm.gray, aspect=1/1.5)
-        ax[1].set_title('Hough transform')
-        ax[1].set_xlabel('Angles (degrees)')
-        ax[1].set_ylabel('Distance (pixels)')
-        ax[1].axis('image')
-
-        ax[2].imshow(image, cmap=cm.gray)
-        for _, angle, dist in zip(*hough_line_peaks(h, theta, d)):
-            y0 = (dist - 0 * np.cos(angle)) / np.sin(angle)
-            y1 = (dist - image.shape[1] * np.cos(angle)) / np.sin(angle)
-            ax[2].plot((0, image.shape[1]), (y0, y1), '-r')
-        ax[2].set_xlim((0, image.shape[1]))
-        ax[2].set_ylim((image.shape[0], 0))
-        ax[2].set_axis_off()
-        ax[2].set_title('Detected lines')
-
-        plt.tight_layout()
-        plt.show()
+        return slipBandAngles
